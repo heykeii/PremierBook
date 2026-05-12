@@ -1,6 +1,7 @@
 import os
 import requests
 import time
+from datetime import datetime
 from supabase import create_client, Client
 
 # 1. Setup Credentials
@@ -35,53 +36,55 @@ def sync_current_nba_players():
     print("--- Syncing ONLY Active NBA Roster ---")
     headers = {"Authorization": bdl_api_key}
     
-    # 1. Map only the 30 active teams
-    active_team_ids = [str(team_id) for team_id in range(1, 31)]
-    teams_query = supabase.table("teams").select("id, api_id").in_("api_id", active_team_ids).execute()
+    current_season = datetime.utcnow().year if datetime.utcnow().month >= 10 else datetime.utcnow().year - 1
+
+    # 1. Map the current NBA teams we already synced.
+    teams_query = supabase.table("teams").select("id, api_id").execute()
     team_map = {t['api_id']: t['id'] for t in teams_query.data}
-    
-    cursor = None
-    total_synced = 0
-    
-    while True:
-        params = [("per_page", 100)]
-        params.extend(("team_ids[]", team_id) for team_id in active_team_ids)
-        if cursor:
-            params.append(("cursor", cursor))
 
-        response = requests.get("https://api.balldontlie.io/v1/players", headers=headers, params=params)
+    if not team_map:
+        print("No teams found in Supabase. Run team sync first.")
+        return
+
+    players_by_api_id = {}
+
+    # 2. Rebuild the roster from current-season team contracts.
+    for api_team_id, supabase_team_id in team_map.items():
+        response = requests.get(
+            "https://api.balldontlie.io/v1/contracts/teams",
+            headers=headers,
+            params={"team_id": api_team_id, "season": current_season},
+            timeout=30,
+        )
+
         if response.status_code != 200:
-            print(f"Error fetching players: {response.status_code} {response.text}")
-            break
+            print(f"Error fetching contracts for team {api_team_id}: {response.status_code} {response.text}")
+            continue
 
-        data = response.json()
-        players = data.get('data', [])
-        
-        players_to_upsert = []
-        for p in players:
-            team_data = p.get('team', {})
-            api_team_id = str(team_data.get('id', p.get('team_id', '')))
-            
-            # Keep only players currently attached to one of the 30 NBA teams.
-            if api_team_id in team_map:
-                players_to_upsert.append({
-                    "api_id": str(p['id']),
-                    "team_id": team_map[api_team_id],
-                    "name": f"{p['first_name']} {p['last_name']}",
-                    "position": p.get('position', ''),
-                    "is_active": True
-                })
+        contracts = response.json().get('data', [])
+        for contract in contracts:
+            player = contract.get('player', {})
+            if not player:
+                continue
 
-        if players_to_upsert:
-            supabase.table("players").upsert(players_to_upsert, on_conflict="api_id").execute()
-            total_synced += len(players_to_upsert)
-            print(f"Added {len(players_to_upsert)} active players...")
+            players_by_api_id[str(player['id'])] = {
+                "api_id": str(player['id']),
+                "team_id": supabase_team_id,
+                "name": f"{player['first_name']} {player['last_name']}",
+                "position": player.get('position', ''),
+                "is_active": True,
+            }
 
-        cursor = data.get('meta', {}).get('next_cursor')
-        if not cursor:
-            break
-            
-    print(f"--- Finished! Total Active Players: {total_synced} ---")
+    players_to_upsert = list(players_by_api_id.values())
+    if not players_to_upsert:
+        print(f"--- Finished! Total Active Players: 0 ---")
+        return
+
+    # 3. Remove old rows so only current players remain in the table.
+    supabase.table("players").delete().neq("api_id", "").execute()
+
+    supabase.table("players").upsert(players_to_upsert, on_conflict="api_id").execute()
+    print(f"--- Finished! Total Active Players: {len(players_to_upsert)} ---")
 
 
 
