@@ -49,31 +49,77 @@ def sync_current_nba_players():
     players_by_api_id = {}
 
     # 2. Rebuild the roster from current-season team contracts.
-    for api_team_id, supabase_team_id in team_map.items():
-        response = requests.get(
-            "https://api.balldontlie.io/v1/contracts/teams",
-            headers=headers,
-            params={"team_id": api_team_id, "season": current_season},
-            timeout=30,
-        )
+    # 2. Prefer using season stats to identify players who actually played this season.
+    #    This avoids retired/former players who remain attached historically.
+    stats_url = "https://api.balldontlie.io/v1/stats"
+    cursor = None
+    while True:
+        params = [("per_page", 100), ("seasons[]", current_season)]
+        if cursor:
+            params.append(("cursor", cursor))
 
-        if response.status_code != 200:
-            print(f"Error fetching contracts for team {api_team_id}: {response.status_code} {response.text}")
-            continue
+        resp = requests.get(stats_url, headers=headers, params=params, timeout=30)
+        if resp.status_code == 401:
+            print("Stats endpoint unauthorized for this API key. Falling back to players endpoint (less accurate).")
+            break
+        if resp.status_code != 200:
+            print(f"Error fetching season stats: {resp.status_code} {resp.text}")
+            break
 
-        contracts = response.json().get('data', [])
-        for contract in contracts:
-            player = contract.get('player', {})
+        stats_data = resp.json().get('data', [])
+        for s in stats_data:
+            player = s.get('player') or {}
             if not player:
                 continue
+            pid = str(player.get('id'))
+            team_id = str(player.get('team_id') or s.get('team', {}).get('id', ''))
+            if team_id in team_map:
+                players_by_api_id[pid] = {
+                    "api_id": pid,
+                    "team_id": team_map[team_id],
+                    "name": f"{player.get('first_name','')} {player.get('last_name','')}",
+                    "position": player.get('position',''),
+                    "is_active": True,
+                }
 
-            players_by_api_id[str(player['id'])] = {
-                "api_id": str(player['id']),
-                "team_id": supabase_team_id,
-                "name": f"{player['first_name']} {player['last_name']}",
-                "position": player.get('position', ''),
-                "is_active": True,
-            }
+        cursor = resp.json().get('meta', {}).get('next_cursor')
+        if not cursor:
+            break
+
+    # If stats were unavailable (401) fall back to players endpoint filtered by team_ids.
+    if not players_by_api_id:
+        print("Attempting fallback: players endpoint with team_ids filter.")
+        players_url = "https://api.balldontlie.io/v1/players"
+        cursor = None
+        active_ids = list(team_map.keys())
+        while True:
+            params = [("per_page", 100)]
+            params.extend(("team_ids[]", tid) for tid in active_ids)
+            if cursor:
+                params.append(("cursor", cursor))
+
+            resp = requests.get(players_url, headers=headers, params=params, timeout=30)
+            if resp.status_code != 200:
+                print(f"Error fetching players fallback: {resp.status_code} {resp.text}")
+                break
+
+            data = resp.json().get('data', [])
+            for p in data:
+                team_data = p.get('team', {})
+                tid = str(team_data.get('id', p.get('team_id', '')))
+                if tid in team_map:
+                    pid = str(p.get('id'))
+                    players_by_api_id[pid] = {
+                        "api_id": pid,
+                        "team_id": team_map[tid],
+                        "name": f"{p.get('first_name','')} {p.get('last_name','')}",
+                        "position": p.get('position',''),
+                        "is_active": True,
+                    }
+
+            cursor = resp.json().get('meta', {}).get('next_cursor')
+            if not cursor:
+                break
 
     players_to_upsert = list(players_by_api_id.values())
     if not players_to_upsert:
