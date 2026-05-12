@@ -1,5 +1,6 @@
 import os
 import requests
+import time
 from supabase import create_client, Client
 
 # 1. Setup Credentials
@@ -9,9 +10,8 @@ bdl_api_key = os.environ.get("BDL_API_KEY")
 supabase: Client = create_client(url, key)
 
 def sync_nba_teams():
-    print("Syncing NBA Teams...")
+    print("--- Starting NBA Teams Sync ---")
     headers = {"Authorization": bdl_api_key}
-    # This endpoint returns ALL NBA teams
     response = requests.get("https://api.balldontlie.io/v1/teams", headers=headers)
     
     if response.status_code != 200:
@@ -19,9 +19,7 @@ def sync_nba_teams():
         return
 
     teams = response.json()['data']
-
     for team in teams:
-        
         conf = team.get('conference', 'N/A')
         div = team.get('division', 'N/A')
         
@@ -31,24 +29,34 @@ def sync_nba_teams():
             "abbreviation": team['abbreviation'],
             "conference_division": f"{conf}/{div}"
         }, on_conflict="api_id").execute()
+    print("NBA Teams Sync Complete.")
 
-def sync_nba_players():
-    print("Syncing NBA Players (Optimized Batch Mode)...")
+def sync_current_nba_players():
+    print("--- Starting Current NBA Players Sync ---")
     headers = {"Authorization": bdl_api_key}
     
-    # 1. CACHE TEAMS: Fetch all teams once to avoid querying the DB in a loop
-    teams_query = supabase.table("teams").select("id, api_id").execute()
-    # Create a dictionary for instant lookup: { "api_id": "internal_uuid" }
+    # Only map the 30 active teams (IDs 1-30)
+    teams_query = supabase.table("teams").select("id, api_id").lte("api_id", "30").execute()
     team_map = {t['api_id']: t['id'] for t in teams_query.data}
-    
+    active_team_ids = list(team_map.keys())
+
     cursor = None
     while True:
         url = "https://api.balldontlie.io/v1/players?per_page=100"
+        for t_id in active_team_ids:
+            url += f"&team_ids[]={t_id}"
+            
         if cursor:
             url += f"&cursor={cursor}"
             
         response = requests.get(url, headers=headers)
+        
+        if response.status_code == 429:
+            print("Rate limited. Sleeping for 60s...")
+            time.sleep(60)
+            continue
         if response.status_code != 200:
+            print(f"Error: {response.status_code}")
             break
 
         data = response.json()
@@ -56,31 +64,27 @@ def sync_nba_players():
         if not players:
             break
 
-        # 2. BATCHING: Prepare a list of players to send all at once
         players_to_upsert = []
-        
         for p in players:
             api_team_id = str(p['team']['id'])
-            
-            # Look up the internal ID from our local dictionary (Zero network cost!)
             if api_team_id in team_map:
                 players_to_upsert.append({
                     "api_id": str(p['id']),
                     "team_id": team_map[api_team_id],
                     "name": f"{p['first_name']} {p['last_name']}",
                     "position": p.get('position', 'N/A'),
-                    "is_active": True,
-                    "injury_status": "Healthy"
+                    "is_active": True
                 })
 
-        # 3. SINGLE DATABASE CALL: Send the whole batch (up to 100 players)
         if players_to_upsert:
-            try:
-                supabase.table("players").upsert(players_to_upsert, on_conflict="api_id").execute()
-                print(f"Successfully upserted {len(players_to_upsert)} players.")
-            except Exception as e:
-                print(f"Error during batch upsert: {e}")
+            supabase.table("players").upsert(players_to_upsert, on_conflict="api_id").execute()
+            print(f"Batch synced {len(players_to_upsert)} current players.")
 
         cursor = data.get('meta', {}).get('next_cursor')
         if not cursor:
             break
+    print("NBA Players Sync Complete.")
+
+if __name__ == "__main__":
+    sync_nba_teams()
+    sync_current_nba_players()
