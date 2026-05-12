@@ -36,19 +36,22 @@ def sync_current_nba_players():
     headers = {"Authorization": bdl_api_key}
     
     # 1. Map only the 30 active teams
-    teams_query = supabase.table("teams").select("id, api_id").lte("api_id", "30").execute()
+    active_team_ids = [str(team_id) for team_id in range(1, 31)]
+    teams_query = supabase.table("teams").select("id, api_id").in_("api_id", active_team_ids).execute()
     team_map = {t['api_id']: t['id'] for t in teams_query.data}
     
     cursor = None
     total_synced = 0
     
     while True:
-        url = "https://api.balldontlie.io/v1/players/active?per_page=100"
+        params = [("per_page", 100)]
+        params.extend(("team_ids[]", team_id) for team_id in active_team_ids)
         if cursor:
-            url += f"&cursor={cursor}"
-            
-        response = requests.get(url, headers=headers)
+            params.append(("cursor", cursor))
+
+        response = requests.get("https://api.balldontlie.io/v1/players", headers=headers, params=params)
         if response.status_code != 200:
+            print(f"Error fetching players: {response.status_code} {response.text}")
             break
 
         data = response.json()
@@ -56,7 +59,8 @@ def sync_current_nba_players():
         
         players_to_upsert = []
         for p in players:
-            api_team_id = str(p['team']['id'])
+            team_data = p.get('team', {})
+            api_team_id = str(team_data.get('id', p.get('team_id', '')))
             
             # Keep only players currently attached to one of the 30 NBA teams.
             if api_team_id in team_map:
