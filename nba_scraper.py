@@ -43,7 +43,7 @@ def sync_current_nba_players():
     total_synced = 0
     
     while True:
-        url = "https://api.balldontlie.io/v1/players?per_page=100"
+        url = "https://api.balldontlie.io/v1/players/active?per_page=100"
         if cursor:
             url += f"&cursor={cursor}"
             
@@ -57,17 +57,14 @@ def sync_current_nba_players():
         players_to_upsert = []
         for p in players:
             api_team_id = str(p['team']['id'])
-            pos = p.get('position', '')
             
-            # THE FILTER:
-            # 1. Must be on one of the 30 active teams
-            # 2. Position must not be empty (historical players often have empty positions)
-            if api_team_id in team_map and pos and pos != "EMPTY":
+            # Keep only players currently attached to one of the 30 NBA teams.
+            if api_team_id in team_map:
                 players_to_upsert.append({
                     "api_id": str(p['id']),
                     "team_id": team_map[api_team_id],
                     "name": f"{p['first_name']} {p['last_name']}",
-                    "position": pos,
+                    "position": p.get('position', ''),
                     "is_active": True
                 })
 
