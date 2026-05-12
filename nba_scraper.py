@@ -15,7 +15,7 @@ supabase: Client = create_client(url, key)
 # Headers are REQUIRED for the official NBA API to avoid 403 Forbidden errors
 HEADERS = {
     'Host': 'stats.nba.com',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.5',
     'Referer': 'https://www.nba.com/',
@@ -46,7 +46,7 @@ def sync_nba_teams():
 def sync_current_nba_players():
     print("--- Syncing Official Active NBA Roster ---")
     
-    # 1. Map the teams from Supabase to get our internal UUIDs
+    # 1. Map the teams from Supabase
     teams_query = supabase.table("teams").select("id, api_id").execute()
     team_map = {t['api_id']: t['id'] for t in teams_query.data}
 
@@ -54,23 +54,35 @@ def sync_current_nba_players():
         print("No teams found. Please sync teams first.")
         return
 
-    # 2. Fetch all players for the current season using the official endpoint
-    # is_only_current_season=1 is the magic filter you wanted!
-    try:
-        loader = commonallplayers.CommonAllPlayers(
-            is_only_current_season=1, 
-            league_id='00', # 00 is the code for the NBA
-            headers=HEADERS,
-            timeout=30
-        )
-        
-        # The data comes back in a 'rowSet' list
-        player_rows = loader.get_dict()['resultSets'][0]['rowSet']
-        
-        # 3. Clean and Batch
+    # 2. Fetch players with Retry Logic
+    player_rows = None
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"Fetching player data (Attempt {attempt + 1})...")
+            loader = commonallplayers.CommonAllPlayers(
+                is_only_current_season=1, 
+                league_id='00', 
+                headers=HEADERS,
+                timeout=120  # Increased timeout to 2 minutes
+            )
+            player_rows = loader.get_dict()['resultSets'][0]['rowSet']
+            break # Success! Exit the retry loop
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                wait = (attempt + 1) * 5
+                print(f"Waiting {wait}s before retrying...")
+                time.sleep(wait)
+            else:
+                print("Max retries reached. Skipping player sync for now.")
+                return
+
+    # 3. Clean and Batch Upsert
+    if player_rows:
         players_to_upsert = []
         for row in player_rows:
-            # NBA API row indices: 0=PersonID, 1=DisplayName, 3=TeamID
             api_pid = str(row[0])
             display_name = row[1]
             api_team_id = str(row[3])
@@ -80,25 +92,18 @@ def sync_current_nba_players():
                     "api_id": api_pid,
                     "team_id": team_map[api_team_id],
                     "name": display_name,
-                    "position": "N/A", # CommonAllPlayers doesn't include position, need a different endpoint for that
+                    "position": "N/A",
                     "is_active": True,
                 })
 
-        # 4. Wipe old players and upsert new ones to keep the roster perfectly clean
         if players_to_upsert:
-            print(f"Wiping old players and inserting {len(players_to_upsert)} active players...")
-            supabase.table("players").delete().neq("api_id", "").execute()
-            
-            # Upsert in chunks of 100 to be safe with Supabase limits
+            print(f"Inserting {len(players_to_upsert)} active players...")
+            # Using a simple upsert to avoid wiping data if the sync is partial
             for i in range(0, len(players_to_upsert), 100):
                 batch = players_to_upsert[i:i+100]
                 supabase.table("players").upsert(batch, on_conflict="api_id").execute()
-                print(f"Uploaded batch {i//100 + 1}")
-                
+            
             print("NBA Players Sync Complete.")
-
-    except Exception as e:
-        print(f"Failed to fetch official player data: {e}")
 
 if __name__ == "__main__":
     sync_nba_teams()
