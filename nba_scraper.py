@@ -1,148 +1,107 @@
 import os
-import requests
 import time
-from datetime import datetime
+import random
 from supabase import create_client, Client
+
+# Official NBA API imports
+from nba_api.stats.static import teams
+from nba_api.stats.endpoints import commonallplayers
 
 # 1. Setup Credentials
 url = os.environ.get("SUPABASE_URL")
 key = os.environ.get("SUPABASE_KEY")
-bdl_api_key = os.environ.get("BDL_API_KEY")
 supabase: Client = create_client(url, key)
 
-def sync_nba_teams():
-    print("--- Starting NBA Teams Sync ---")
-    headers = {"Authorization": bdl_api_key}
-    response = requests.get("https://api.balldontlie.io/v1/teams", headers=headers)
-    
-    if response.status_code != 200:
-        print(f"Error fetching teams: {response.status_code}")
-        return
+# Headers are REQUIRED for the official NBA API to avoid 403 Forbidden errors
+HEADERS = {
+    'Host': 'stats.nba.com',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Referer': 'https://www.nba.com/',
+    'Origin': 'https://www.nba.com',
+    'Connection': 'keep-alive',
+}
 
-    teams = response.json()['data']
-    for team in teams:
-        conf = team.get('conference', 'N/A')
-        div = team.get('division', 'N/A')
-        
-        supabase.table("teams").upsert({
+def sync_nba_teams():
+    print("--- Starting Official NBA Teams Sync ---")
+    # nba_api's static teams list is built into the library (no network call needed)
+    nba_teams = teams.get_teams()
+    
+    teams_to_upsert = []
+    for team in nba_teams:
+        # Note: NBA teams don't have conference/division in the static list, 
+        # but we can add them manually or leave as N/A for now.
+        teams_to_upsert.append({
             "api_id": str(team['id']),
             "full_name": team['full_name'],
             "abbreviation": team['abbreviation'],
-            "conference_division": f"{conf}/{div}"
-        }, on_conflict="api_id").execute()
-    print("NBA Teams Sync Complete.")
+            "conference_division": "N/A" 
+        })
+
+    if teams_to_upsert:
+        supabase.table("teams").upsert(teams_to_upsert, on_conflict="api_id").execute()
+        print(f"Successfully synced {len(teams_to_upsert)} official NBA teams.")
 
 def sync_current_nba_players():
-    print("--- Syncing ONLY Active NBA Roster ---")
-    headers = {"Authorization": bdl_api_key}
+    print("--- Syncing Official Active NBA Roster ---")
     
-    current_season = datetime.utcnow().year if datetime.utcnow().month >= 10 else datetime.utcnow().year - 1
-
-    # 1. Map the current NBA teams we already synced.
+    # 1. Map the teams from Supabase to get our internal UUIDs
     teams_query = supabase.table("teams").select("id, api_id").execute()
     team_map = {t['api_id']: t['id'] for t in teams_query.data}
 
     if not team_map:
-        print("No teams found in Supabase. Run team sync first.")
+        print("No teams found. Please sync teams first.")
         return
 
-    players_by_api_id = {}
+    # 2. Fetch all players for the current season using the official endpoint
+    # is_only_current_season=1 is the magic filter you wanted!
+    try:
+        loader = commonallplayers.CommonAllPlayers(
+            is_only_current_season=1, 
+            league_id='00', # 00 is the code for the NBA
+            headers=HEADERS,
+            timeout=30
+        )
+        
+        # The data comes back in a 'rowSet' list
+        player_rows = loader.get_dict()['resultSets'][0]['rowSet']
+        
+        # 3. Clean and Batch
+        players_to_upsert = []
+        for row in player_rows:
+            # NBA API row indices: 0=PersonID, 1=DisplayName, 3=TeamID
+            api_pid = str(row[0])
+            display_name = row[1]
+            api_team_id = str(row[3])
 
-    # 2. Rebuild the roster from current-season team contracts.
-    # 2. Prefer using season stats to identify players who actually played this season.
-    #    This avoids retired/former players who remain attached historically.
-    stats_url = "https://api.balldontlie.io/v1/stats"
-    cursor = None
-    while True:
-        params = [("per_page", 100), ("seasons[]", current_season)]
-        if cursor:
-            params.append(("cursor", cursor))
-
-        resp = requests.get(stats_url, headers=headers, params=params, timeout=30)
-        if resp.status_code == 401:
-            print("Stats endpoint unauthorized for this API key. Falling back to players endpoint (less accurate).")
-            break
-        if resp.status_code != 200:
-            print(f"Error fetching season stats: {resp.status_code} {resp.text}")
-            break
-
-        stats_data = resp.json().get('data', [])
-        for s in stats_data:
-            player = s.get('player') or {}
-            if not player:
-                continue
-            pid = str(player.get('id'))
-            team_id = str(player.get('team_id') or s.get('team', {}).get('id', ''))
-            if team_id in team_map:
-                players_by_api_id[pid] = {
-                    "api_id": pid,
-                    "team_id": team_map[team_id],
-                    "name": f"{player.get('first_name','')} {player.get('last_name','')}",
-                    "position": player.get('position',''),
+            if api_team_id in team_map:
+                players_to_upsert.append({
+                    "api_id": api_pid,
+                    "team_id": team_map[api_team_id],
+                    "name": display_name,
+                    "position": "N/A", # CommonAllPlayers doesn't include position, need a different endpoint for that
                     "is_active": True,
-                }
+                })
 
-        cursor = resp.json().get('meta', {}).get('next_cursor')
-        if not cursor:
-            break
+        # 4. Wipe old players and upsert new ones to keep the roster perfectly clean
+        if players_to_upsert:
+            print(f"Wiping old players and inserting {len(players_to_upsert)} active players...")
+            supabase.table("players").delete().neq("api_id", "").execute()
+            
+            # Upsert in chunks of 100 to be safe with Supabase limits
+            for i in range(0, len(players_to_upsert), 100):
+                batch = players_to_upsert[i:i+100]
+                supabase.table("players").upsert(batch, on_conflict="api_id").execute()
+                print(f"Uploaded batch {i//100 + 1}")
+                
+            print("NBA Players Sync Complete.")
 
-    # If stats were unavailable (401) fall back to players endpoint filtered by team_ids.
-    if not players_by_api_id:
-        print("Attempting fallback: players endpoint with team_ids filter.")
-        players_url = "https://api.balldontlie.io/v1/players"
-        cursor = None
-        active_ids = list(team_map.keys())
-        while True:
-            params = [("per_page", 100)]
-            params.extend(("team_ids[]", tid) for tid in active_ids)
-            if cursor:
-                params.append(("cursor", cursor))
-
-            resp = requests.get(players_url, headers=headers, params=params, timeout=30)
-            if resp.status_code != 200:
-                print(f"Error fetching players fallback: {resp.status_code} {resp.text}")
-                break
-
-            data = resp.json().get('data', [])
-            for p in data:
-                team_data = p.get('team', {})
-                tid = str(team_data.get('id', p.get('team_id', '')))
-                if tid in team_map:
-                    pid = str(p.get('id'))
-                    players_by_api_id[pid] = {
-                        "api_id": pid,
-                        "team_id": team_map[tid],
-                        "name": f"{p.get('first_name','')} {p.get('last_name','')}",
-                        "position": p.get('position',''),
-                        "is_active": True,
-                    }
-
-            cursor = resp.json().get('meta', {}).get('next_cursor')
-            if not cursor:
-                break
-
-    players_to_upsert = list(players_by_api_id.values())
-    if not players_to_upsert:
-        print(f"--- Finished! Total Active Players: 0 ---")
-        return
-
-    # 3. Remove old rows so only current players remain in the table.
-    supabase.table("players").delete().neq("api_id", "").execute()
-
-    supabase.table("players").upsert(players_to_upsert, on_conflict="api_id").execute()
-    print(f"--- Finished! Total Active Players: {len(players_to_upsert)} ---")
-
-
-
-
-
-
-
-
-
-
-
+    except Exception as e:
+        print(f"Failed to fetch official player data: {e}")
 
 if __name__ == "__main__":
     sync_nba_teams()
+    # Adding a small polite delay between big tasks
+    time.sleep(random.uniform(1.5, 3.0))
     sync_current_nba_players()
