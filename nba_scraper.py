@@ -33,29 +33,46 @@ def sync_nba_teams():
         }, on_conflict="api_id").execute()
 
 def sync_nba_players():
-    print("Syncing NBA Players...")
+    print("Syncing NBA Players (All Pages)...")
     headers = {"Authorization": bdl_api_key}
-    # Fetching players (paginated)
-    response = requests.get("https://api.balldontlie.io/v1/players?per_page=100", headers=headers)
+    cursor = None  # The API uses a cursor to track the next page
     
-    if response.status_code != 200:
-        print(f"Error fetching players: {response.status_code}")
-        return
-
-    players = response.json()['data']
-
-    for p in players:
-        # Link player to the team using the team's api_id
-        team_id_query = supabase.table("teams").select("id").eq("api_id", str(p['team']['id'])).execute()
+    while True:
+        # Build the URL with the cursor if it exists
+        url = "https://api.balldontlie.io/v1/players?per_page=100"
+        if cursor:
+            url += f"&cursor={cursor}"
+            
+        response = requests.get(url, headers=headers)
         
-        if team_id_query.data:
-            internal_team_id = team_id_query.data[0]['id']
-            supabase.table("players").upsert({
-                "api_id": str(p['id']),
-                "team_id": internal_team_id,
-                "name": f"{p['first_name']} {p['last_name']}",
-                "position": p.get('position', 'N/A')
-            }, on_conflict="api_id").execute()
+        if response.status_code != 200:
+            print(f"Error: {response.status_code}")
+            break
+
+        data = response.json()
+        players = data.get('data', [])
+        
+        if not players:
+            break  # No more players to fetch
+
+        for p in players:
+            team_id_query = supabase.table("teams").select("id").eq("api_id", str(p['team']['id'])).execute()
+            
+            if team_id_query.data:
+                internal_team_id = team_id_query.data[0]['id']
+                supabase.table("players").upsert({
+                    "api_id": str(p['id']),
+                    "team_id": internal_team_id,
+                    "name": f"{p['first_name']} {p['last_name']}",
+                    "position": p.get('position', 'N/A')
+                }, on_conflict="api_id").execute()
+
+        # Update the cursor for the next loop
+        cursor = data.get('meta', {}).get('next_cursor')
+        if not cursor:
+            break
+            
+        print(f"Moving to next page (Cursor: {cursor})...")
 
 if __name__ == "__main__":
     sync_nba_teams()
